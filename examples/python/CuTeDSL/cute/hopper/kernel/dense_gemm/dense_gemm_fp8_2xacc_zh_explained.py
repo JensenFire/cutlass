@@ -97,10 +97,16 @@ Constraints:
 * Cluster shape M/N must be positive and power of 2, total cluster size <= 4
 * The contiguous dimension of tensors must be at least 16 bytes aligned (16 elements for FP8)
 * mma_promotion_interval must be a multiple of num_k_blocks per k_tile (typically 4)
+
+中文说明：
+这是 Hopper 上的 FP8 2xAcc GEMM 示例，计算 D = scale_a * scale_b * A * B。A/B 固定为 FP8 E4M3FN 且只支持 k-major，accumulator 使用 Float32。
+2xAcc 的核心是维护两个累加器：accum_temp 接收 WGMMA 直接写入的临时部分和，accum 保存周期性提升后的主累加结果。
+每经过 mma_promotion_interval 条 MMA 指令，就把 accum_temp 逐元素加到 accum，然后清零 accum_temp，以缓解 FP8 长 K 累加的数值损失。
 """
 
 
 # Helpers to parse args
+# 参数解析辅助函数
 # 函数 parse_comma_separated_ints：解析逗号分隔的整数列表，例如把 "128,256" 转成 (128, 256)，供 argparse 处理 tile/shape 参数。
 # 参数：s；返回：未显式标注。
 def parse_comma_separated_ints(s: str):
@@ -254,6 +260,9 @@ class HopperFP8WarpSpecialized2xAccGemmKernel:
         - CTA tile M must be 64/128
         - CTA tile N must be 64/128/256
         - Cluster shape M/N must be positive and power of 2, total cluster size <= 4
+
+    中文说明：
+    这个类封装 FP8 E4M3FN 输入、Float32 累加的 2xAcc GEMM。它沿用 persistent/warp-specialized 框架，并在 mainloop 中周期性把临时 accumulator promote 到主 accumulator。
     """
 
     # 函数 HopperFP8WarpSpecialized2xAccGemmKernel.__init__：初始化 FP8 2xAcc kernel，包括 promotion
@@ -275,6 +284,7 @@ class HopperFP8WarpSpecialized2xAccGemmKernel:
         self.raster_along_m = raster_along_m
         self.mma_inst_shape_mn = None
         # K dimension is deferred in _setup_attributes
+        # K 维 tile 大小会在 _setup_attributes 中根据 WGMMA 形状确定。
         self.tile_shape_mnk = (*tile_shape_mn, 1)
         # For large tile size, using two warp groups is preferred because using only one warp
         # group may result in register spill
@@ -326,7 +336,11 @@ class HopperFP8WarpSpecialized2xAccGemmKernel:
     # 函数 HopperFP8WarpSpecialized2xAccGemmKernel._setup_attributes：构造 FP8 WGMMA tiled_mma，验证
     # promotion interval，并生成 multicast、stage 和 SMEM layout。 参数：self；返回：未显式标注。
     def _setup_attributes(self):
-        """Set up configurations that are dependent on GEMM inputs."""
+        """Set up configurations that are dependent on GEMM inputs.
+
+        中文说明：
+        根据 FP8 A/B 和输出 D 的 layout 派生 WGMMA tiled_mma、K tile、TMA multicast、epilogue tile、pipeline stage 和 SMEM layout，并验证 promotion interval。
+        """
 
         # check the cta tile shape
         if self.tile_shape_mnk[0] not in [64, 128]:
@@ -355,7 +369,9 @@ class HopperFP8WarpSpecialized2xAccGemmKernel:
         )
 
         # Validate that mma_promotion_interval is a multiple of num_k_blocks
+        # 验证 promotion interval 必须是当前 K tile 内 WGMMA block 数的整数倍。
         # so the counter hits the interval exactly (promotion uses == not >=)
+        # 这里 promotion 条件用 ==，所以计数器必须能精确命中 interval。
         num_k_blocks = mma_inst_tile_k
         if self.mma_promotion_interval % num_k_blocks != 0:
             # 遇到不支持的 dtype/layout/alignment 或运行环境时主动报错，避免继续生成非法 kernel。
@@ -430,6 +446,9 @@ class HopperFP8WarpSpecialized2xAccGemmKernel:
         :param scale_b: Scalar scale factor for B (1-element Float32 tensor)
         :param max_active_clusters: Maximum number of active clusters
         :param stream: CUDA stream
+
+        中文说明：
+        host/JIT 入口：接收 A/B/D 和 scale_a/scale_b，创建 TMA atom/tensor 与 persistent scheduler 参数，定义 shared storage，然后 launch FP8 2xAcc device kernel。
         """
 
         # setup static attributes before smem/grid/tma computation
@@ -564,6 +583,9 @@ class HopperFP8WarpSpecialized2xAccGemmKernel:
         Every mma_promotion_interval MMA instructions, accum_temp is promoted
         (element-wise added) into accumulators, then WGMMA is told to zero
         accum_temp on its next instruction.
+
+        中文说明：
+        device kernel 主体：DMA warp group 负责 TMA load；MMA warp group 执行 WGMMA 到 accum_temp，并按 promotion interval 合并到主 accumulator；epilogue 应用 scale 后写回 D。
         """
 
         tidx, _, _ = cute.arch.thread_idx()
@@ -1125,7 +1147,11 @@ class HopperFP8WarpSpecialized2xAccGemmKernel:
         smem_capacity: int,
         occupancy: int,
     ) -> tuple[int, int]:
-        """Computes the number of stages for A/B/C operands based on heuristics."""
+        """Computes the number of stages for A/B/C operands based on heuristics.
+
+        中文说明：
+        按 tile、dtype、epilogue tile 和 SMEM 容量估算 A/B mainloop stage 与 epilogue stage，给 FP8 pipeline 分配 shared memory。
+        """
         a_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
         b_shape = cute.slice_(tile_shape_mnk, (0, None, None))
         ab_bytes_per_stage = (
@@ -1153,7 +1179,11 @@ class HopperFP8WarpSpecialized2xAccGemmKernel:
         is_cooperative: bool = False,
         epi_tile_override: Optional[tuple[int, int]] = None,
     ) -> tuple[int, int]:
-        """Compute the epilogue tile shape or use override if provided."""
+        """Compute the epilogue tile shape or use override if provided.
+
+        中文说明：
+        计算 epilogue 写回 D 的子 tile 形状；输出 dtype 较窄时可使用更大的 N 方向宽度以提高写回效率。
+        """
         if epi_tile_override is not None:
             return epi_tile_override
         if is_cooperative:
@@ -1183,7 +1213,11 @@ class HopperFP8WarpSpecialized2xAccGemmKernel:
         c_layout: utils.LayoutEnum,
         epi_stage: int,
     ) -> tuple[cute.ComposedLayout, cute.ComposedLayout, cute.ComposedLayout]:
-        """Create shared memory layouts for A, B, and D tensors."""
+        """Create shared memory layouts for A, B, and D tensors.
+
+        中文说明：
+        创建 A/B/D 的 staged SMEM layout。A/B 用于 TMA load 与 WGMMA 读取，D 用于 epilogue 暂存和 TMA store。
+        """
         a_smem_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
 
         a_is_k_major = (
@@ -1254,7 +1288,11 @@ class HopperFP8WarpSpecialized2xAccGemmKernel:
         raster_along_m: bool,
         max_active_clusters: cutlass.Constexpr,
     ) -> tuple[int, int, int]:
-        """Compute grid shape for the output tensor D."""
+        """Compute grid shape for the output tensor D.
+
+        中文说明：
+        根据 D 的 tile 划分、cluster shape 和 max_active_clusters 生成 persistent scheduler 参数与 launch grid。
+        """
         c_shape = cute.slice_(tile_shape_mnk, (None, None, 0))
         gd = cute.zipped_divide(d, tiler=c_shape)
         num_ctas_mnl = gd[(0, (None, None, None))].shape
@@ -1280,7 +1318,11 @@ class HopperFP8WarpSpecialized2xAccGemmKernel:
         epi_smem_layout_staged: cute.ComposedLayout,
         epi_tile: tuple[int, int],
     ) -> tuple[cute.CopyAtom, cute.Tensor]:
-        """Create TMA atoms and tensors for D tensor storage."""
+        """Create TMA atoms and tensors for D tensor storage.
+
+        中文说明：
+        创建 D 的 shared-to-global TMA store atom 和 tensor 视图，用于 epilogue 写回输出。
+        """
         epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
         # 下面是一次多返回值解包：把右侧计算结果拆成 (tma_atom_d, tma_tensor_d)，多行参数保持原代码结构，不逐行解释。
         tma_atom_d, tma_tensor_d = cute.nvgpu.cpasync.make_tiled_tma_atom(
@@ -1302,7 +1344,11 @@ class HopperFP8WarpSpecialized2xAccGemmKernel:
         smem_tile: tuple[int, int],
         mcast_dim: int,
     ) -> tuple[cute.CopyAtom, cute.Tensor]:
-        """Create TMA atoms and tensors for input tensors."""
+        """Create TMA atoms and tensors for input tensors.
+
+        中文说明：
+        创建 A/B 的 global-to-shared TMA load atom 和 tensor 视图；cluster 维度大于 1 时启用 multicast。
+        """
         op = (
             cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
             if mcast_dim == 1
@@ -1358,6 +1404,9 @@ def run(
     :param skip_ref_check: Whether to skip reference validation
     :param use_cold_l2: Whether to use cold L2 cache strategy
     :return: Execution time in microseconds
+
+    中文说明：
+    完整 host 示例入口：创建 FP8 A/B 和输出 D，准备 scale tensor，编译并运行 kernel，执行可选参考校验和 benchmark。
     """
     import torch
     import cutlass.torch as cutlass_torch

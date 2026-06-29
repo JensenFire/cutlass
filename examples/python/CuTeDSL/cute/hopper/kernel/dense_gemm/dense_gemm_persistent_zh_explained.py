@@ -108,10 +108,16 @@ Constraints are same as dense_gemm.py:
 * Cluster shape M/N must be positive and power of 2, total cluster size <= 4
 * The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
   i.e, number of elements is a multiple of 8, 16 for Float16, and Float8, respectively.
+
+中文说明：
+这是 Hopper 上的 persistent batched dense GEMM 示例，计算 C = A * B。它在普通 dense GEMM 的基础上加入 persistent tile scheduling：有限数量的活跃 CTA/cluster 会循环领取多个输出 tile。
+kernel 使用 warp specialization：DMA warp group 负责 TMA load，MMA warp group 负责 WGMMA 和 epilogue store，从而在 tile 之间更好地重叠搬运和计算。
+约束基本与 dense_gemm.py 相同：支持 fp16/fp8/int8/uint8 输入，8-bit 类型只支持 k-major，CTA tile 和 cluster shape 必须满足 Hopper WGMMA/TMA 的限制。
 """
 
 
 # Helpers to parse args
+# 参数解析辅助函数
 # 函数 parse_comma_separated_ints：解析逗号分隔的整数列表，例如把 "128,256" 转成 (128, 256)，供 argparse 处理 tile/shape 参数。
 # 参数：s；返回：未显式标注。
 def parse_comma_separated_ints(s: str):
@@ -279,6 +285,9 @@ class HopperWgmmaGemmPersistentKernel:
         ...     cluster_shape_mn=(1, 1)
         ... )
         >>> gemm(a_tensor, b_tensor, c_tensor, stream)
+
+    中文说明：
+    这个类封装 persistent Hopper dense GEMM。它保存 tile/cluster/scheduler 配置，按 persistent scheduler 让 CTA/cluster 循环处理多个输出 tile，并使用 TMA + WGMMA 完成 mainloop 和 epilogue。
     """
 
     # 函数 HopperWgmmaGemmPersistentKernel.__init__：初始化 persistent kernel
@@ -304,6 +313,9 @@ class HopperWgmmaGemmPersistentKernel:
         :type tile_shape_mn: Tuple[int, int]
         :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
         :type cluster_shape_mn: Tuple[int, int]
+
+        中文说明：
+        初始化 persistent GEMM kernel 的静态配置，包括 accumulator dtype、CTA tile、cluster shape、swizzle/raster 策略、warp specialization 线程组织、寄存器预算和 shared-memory 容量。
         """
 
         self.acc_dtype = acc_dtype
@@ -313,6 +325,7 @@ class HopperWgmmaGemmPersistentKernel:
         self.raster_along_m = raster_along_m
         self.mma_inst_shape_mn = None
         # K dimension is deferred in _setup_attributes
+        # K 维 tile 大小会在 _setup_attributes 中根据 WGMMA 形状确定。
         self.tile_shape_mnk = (*tile_shape_mn, 1)
         # For large tile size, using two warp groups is preferred because using only one warp
         # group may result in register spill
@@ -375,6 +388,9 @@ class HopperWgmmaGemmPersistentKernel:
         - Computing epilogue subtile
         - Setting up A/B/C stage counts in shared memory
         - Computing A/B/C shared memory layout
+
+        中文说明：
+        根据实际 A/B/C tensor 的 dtype 和 layout 派生 tiled MMA、K tile、multicast 配置、epilogue tile、pipeline stage 和 staged SMEM layout。
         """
 
         # check the cta tile shape
@@ -415,6 +431,7 @@ class HopperWgmmaGemmPersistentKernel:
         )
 
         # Compute stage before compute smem layout
+        # 先估算 pipeline stage，再创建带 stage 维的 SMEM layout。
         # 下面根据 tile 大小、dtype 位宽和共享内存容量计算 pipeline stage 数；A/B stage 决定 mainloop 预取深度，epilogue stage
         # 决定写回缓冲数量。
         self.ab_stage, self.epi_stage = self._compute_stages(
@@ -474,6 +491,9 @@ class HopperWgmmaGemmPersistentKernel:
         :type max_active_clusters: cutlass.Constexpr
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
+
+        中文说明：
+        host/JIT 入口：记录 tensor 属性，创建 A/B load 与 C store 的 TMA atom/tensor，计算 persistent scheduler 参数和 launch grid，定义 shared storage，最后 launch device kernel。
         """
 
         # setup static attributes before smem/grid/tma computation
@@ -634,6 +654,9 @@ class HopperWgmmaGemmPersistentKernel:
         :type epi_smem_layout_staged: cute.ComposedLayout
         :param tile_sched_params: Parameters for the persistent tile scheduler
         :type tile_sched_params: utils.PersistentTileSchedulerParams
+
+        中文说明：
+        device kernel 主体：DMA warp group 负责 TMA load 和 pipeline producer，MMA warp group 负责 WGMMA consumer、accumulator 计算和 epilogue TMA store；persistent scheduler 让同一批 CTA 反复领取 tile。
         """
 
         tidx, _, _ = cute.arch.thread_idx()
@@ -1121,6 +1144,9 @@ class HopperWgmmaGemmPersistentKernel:
         :return: A tuple containing the computed number of stages for:
                  (A/B operand stages, epilogue stages)
         :rtype: tuple[int, int]
+
+        中文说明：
+        按 tile 大小、dtype 位宽、epilogue tile、SMEM 容量和 occupancy 估算 A/B mainloop stage 与 epilogue stage，避免超过可用 shared memory。
         """
 
         a_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
@@ -1163,6 +1189,9 @@ class HopperWgmmaGemmPersistentKernel:
 
         :return: Computed epilogue tile shape
         :rtype: Tuple[int, int]
+
+        中文说明：
+        计算 epilogue 写回时一次处理的 C 子 tile。cooperative 情况使用更适合多 warp group 协作的形状，否则按输出 dtype 位宽选择较合适的 N 方向宽度。
         """
         if epi_tile_override is not None:
             return epi_tile_override
@@ -1218,6 +1247,9 @@ class HopperWgmmaGemmPersistentKernel:
 
         :return: Tuple of shared memory layouts for A, B, and C
         :rtype: Tuple[cute.ComposedLayout, cute.ComposedLayout, cute.ComposedLayout]
+
+        中文说明：
+        创建 A/B/C 的 staged shared-memory layout。A/B layout 要匹配 TMA load 和 WGMMA 读取，C layout 要匹配 accumulator 到 SMEM 再到 TMA store 的 epilogue 路径。
         """
         a_smem_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
 
@@ -1302,6 +1334,9 @@ class HopperWgmmaGemmPersistentKernel:
 
         :return: Grid shape for kernel launch.
         :rtype: tuple[int, int, int]
+
+        中文说明：
+        根据输出 C 的 tile 总数、cluster shape 和 max_active_clusters 生成 persistent tile scheduler 参数以及实际 launch grid。
         """
 
         c_shape = cute.slice_(tile_shape_mnk, (None, None, 0))
@@ -1340,6 +1375,9 @@ class HopperWgmmaGemmPersistentKernel:
 
         :return: TMA atom and tensor for C
         :rtype: Tuple[cute.CopyAtom, cute.Tensor]
+
+        中文说明：
+        创建 C 的 shared-to-global TMA store atom 和 tensor 视图，用于 epilogue 把 SMEM 中的输出 tile 写回 GMEM。
         """
         epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
         # 下面是一次多返回值解包：把右侧计算结果拆成 (tma_atom_c, tma_tensor_c)，多行参数保持原代码结构，不逐行解释。
@@ -1375,6 +1413,9 @@ class HopperWgmmaGemmPersistentKernel:
 
         :return: TMA atom and tensor
         :rtype: Tuple[cute.CopyAtom, cute.Tensor]
+
+        中文说明：
+        创建 A 或 B 的 global-to-shared TMA load atom 和 tensor 视图；当 mcast_dim 大于 1 时使用 TMA multicast。
         """
         op = (
             cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
@@ -1422,6 +1463,9 @@ class HopperWgmmaGemmPersistentKernel:
 
         :return: True if the dtypes are valid, False otherwise
         :rtype: bool
+
+        中文说明：
+        检查 A/B/C 与 accumulator dtype 组合是否合法，包括 fp16 A/B 同类型、A/B 位宽一致、8-bit 输入 layout 限制和 accumulator 兼容关系。
         """
         is_valid = True
 
@@ -1535,6 +1579,9 @@ class HopperWgmmaGemmPersistentKernel:
 
         :return: True if the problem shape is valid, False otherwise
         :rtype: bool
+
+        中文说明：
+        检查 A/B/C 的连续维是否满足 16 字节对齐，这是 TMA bulk tensor copy 的基本要求。
         """
         is_valid = True
 
@@ -1611,6 +1658,9 @@ def run(
     :type use_cold_l2: bool, optional
     :return: Execution time of the GEMM kernel in microseconds
     :rtype: float
+
+    中文说明：
+    完整 host 示例入口：创建并排列 A/B/C tensor，JIT 编译 persistent kernel，执行可选参考校验，并按 warmup/iteration 参数 benchmark。
     """
     import torch
     import cutlass.torch as cutlass_torch

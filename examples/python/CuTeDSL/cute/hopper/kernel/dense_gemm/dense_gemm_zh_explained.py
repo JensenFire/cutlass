@@ -105,11 +105,50 @@ Constraints:
 * Cluster shape M/N must be positive and power of 2, total cluster size <= 4
 * The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
   i.e, number of elements is a multiple of 8, 16 for Float16, and Float8, respectively.
+
+中文说明：
+这是一个面向 NVIDIA Hopper 架构、使用 CuTe DSL 编写的高性能 batched dense GEMM 示例，计算 C = A * B。
+- 矩阵 A 的逻辑形状是 MxKxL，L 是 batch 维；A 可以是 row-major("K") 或 column-major("M")。
+- 矩阵 B 的逻辑形状是 NxKxL，L 是 batch 维；B 可以是 row-major("N") 或 column-major("K")。
+- 矩阵 C 的逻辑形状是 MxNxL，L 是 batch 维；C 可以是 row-major("N") 或 column-major("M")。
+
+这个 GEMM kernel 支持：
+    - 使用 TMA 高效完成 global memory 和 shared memory 之间的数据搬运
+    - 使用 Hopper WGMMA 指令执行矩阵乘加
+    - 通过 cluster 上的 TMA multicast 减少 L2/global memory 流量
+    - 使用多 stage pipeline 重叠数据搬运和计算
+
+执行流程：
+1. 使用 TMA 将 A/B 从 GMEM 搬到 SMEM。
+2. 使用 WGMMA 做矩阵乘加，结果累加到寄存器 accumulator。
+3. 将寄存器中的结果写到 SMEM，再通过 TMA store 写回 GMEM。
+
+Hopper WGMMA 的核心行为：
+- 从 SMEM 读取矩阵 A
+- 从 SMEM 读取矩阵 B
+- 执行 MMA，并把结果写入 accumulator register
+
+运行示例：上面的命令会计算 M=8192、N=8192、K=8192、batch_count=1 的 batched GEMM。
+Hopper WGMMA tile shape 是 128x256x64，cluster shape 是 (1,1)。输入、累加器和输出 dtype
+分别是 fp16、fp32 和 fp16。也可以用 NCU profiler 收集性能数据。
+
+约束：
+* 支持的输入 dtype：fp16、fp8(e4m3fn/e5m2)、int8、uint8。
+* fp16 输入要求 A/B dtype 相同；fp8 和 8-bit integer 输入允许 A/B 使用同宽的不同 dtype。
+* 8-bit ((e4m3fn, e5m2, int8, uint8))类型只支持 k-major layout。
+* CTA tile M 只能是 64/128，CTA tile N 只能是 64/128/256。
+* Cluster shape 的 M/N 必须是正数且为 2 的幂，总 cluster size 不超过 4。
+* A/B/C tensor 的连续维至少需要 16 字节对齐。bf16 则num_elements是8的倍数，fp8则num elements是16的倍数
+- TMA bulk tensor copy 对连续内存维度通常希望按 16B 粒度对齐/整除
+
+
+疑问： 在C:\Users\xinji1\Desktop\interv\cutlass\examples\python\CuTeDSL里，有没有cluster size >1 的kernel？
 """
 
 
 # /////////////////////////////////////////////////////////////////////////////
 #  Helpers to parse args
+#  参数解析辅助函数
 # /////////////////////////////////////////////////////////////////////////////
 # 函数 parse_comma_separated_ints：解析逗号分隔的整数列表，例如把 "128,256" 转成 (128, 256)，供 argparse 处理 tile/shape 参数。
 # 参数：s；返回：未显式标注。
@@ -224,6 +263,7 @@ def parse_arguments() -> argparse.Namespace:
 
 # /////////////////////////////////////////////////////////////////////////////
 #  Host setup and device kernel launch
+#  Host 端设置与 device kernel 启动
 # /////////////////////////////////////////////////////////////////////////////
 
 
@@ -268,13 +308,24 @@ class HopperWgmmaGemmKernel:
         ...     cluster_shape_mn=(1, 1)
         ... )
         >>> gemm(a_tensor, b_tensor, c_tensor, stream)
+
+    中文说明：
+    这个类封装 Hopper batched GEMM kernel，支持多种输入 dtype，并使用 Hopper 特有的 TMA、WGMMA、
+    cluster multicast 和 staged pipeline。构造时传入 accumulator dtype、CTA tile shape 和 cluster shape；
+    调用对象时会根据实际 A/B/C tensor 派生 layout、TMA atom、shared-memory layout 和 launch grid。
+
+    注意：
+        - fp16 输入要求 A/B dtype 一致。
+        - fp8、int8、uint8 输入只支持 k-major layout。
+        - accumulator 对浮点输入通常是 Float32/Float16，对 int8/uint8 输入是 Int32。
+        - CTA tile 和 cluster shape 必须满足 Hopper WGMMA/TMA 的约束。
     """
 
     # 函数 HopperWgmmaGemmKernel.__init__：初始化普通 GEMM 的静态配置，包括 accumulator dtype、CTA tile、cluster
     # shape、warp group 数、线程数和共享内存容量。 参数：self, acc_dtype, tile_shape_mn, cluster_shape_mn；返回：未显式标注。
     def __init__(
         self,
-        acc_dtype: type[cutlass.Numeric],
+        acc_dtype: type[cutlass.Numeric], # 比如cutlass.Float16.width
         tile_shape_mn: tuple[int, int],
         cluster_shape_mn: tuple[int, int],
     ):
@@ -290,34 +341,57 @@ class HopperWgmmaGemmKernel:
         :type tile_shape_mn: Tuple[int, int]
         :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
         :type cluster_shape_mn: Tuple[int, int]
+
+        中文说明：
+        初始化 Hopper dense GEMM kernel 的静态配置，包括 accumulator dtype、CTA tile shape、cluster shape、
+        warp-group 组织、CTA 线程数、shared-memory 容量以及后续会填充的 TMA/pipeline/layout 属性。
         """
 
         self.acc_dtype = acc_dtype
 
-        self.cluster_shape_mn = cluster_shape_mn
+        self.cluster_shape_mn = cluster_shape_mn # 
         self.mma_inst_shape_mn = None
         # K dimension is deferred in _setup_attributes
+        # K 维 tile 大小会在 _setup_attributes 中根据 WGMMA 形状再确定。
         self.tile_shape_mnk = (*tile_shape_mn, 1)
+        # 注意： 看情况选择两个warp group
         # For large tile size, using two warp groups is preferred because using only one warp
+        # 对较大的 tile，优先使用两个 warp group；只用一个 warp group 时寄存器压力更容易导致 spill。
         # group may result in register spill
+        # 上一行说明的是大 tile 下单 warp group 可能带来的寄存器溢出风险。
         self.atom_layout_mnk = (
             (2, 1, 1)
             if self.tile_shape_mnk[0] > 64 and self.tile_shape_mnk[1] > 128
             else (1, 1, 1)
         )
-        self.num_mcast_ctas_a = None
+        """
+        如何理解这个atom_layout_mnk:
+        
+            MMA atom (WGMMA atom):  一个基础 WGMMA 操作的描述
+            atom_layout: 这些 atom 在 CTA tile 里如何排布 （）
+            tile shape:   最终这个 tiled_mma 覆盖多大的 M/N/K tile
+            
+            
+        """
+        
+        
+        self.num_mcast_ctas_a = None # TMA multicast 时，同一份 A/B tile 要广播给 cluster 内多少个 CTA。
         self.num_mcast_ctas_b = None
         self.is_a_mcast = False
         self.is_b_mcast = False
         self.tiled_mma = None
 
-        self.occupancy = 1
-        self.mma_warp_groups = math.prod(self.atom_layout_mnk)
+        self.occupancy = 1 # 疑问： 如何改 occupancy ： Target number of CTAs per SM (occupancy).
+        self.mma_warp_groups = math.prod(self.atom_layout_mnk) # 参与wgmma的warp group的数量
         self.num_threads_per_warp_group = 128
         self.threads_per_cta = self.mma_warp_groups * self.num_threads_per_warp_group
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_90")
+        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_90") # shared mem的大小
 
-        self.ab_stage = None
+        self.ab_stage = None # 
+        """
+        ab_stage  = mainloop 里 A/B TMA load -> WGMMA consume 的 pipeline 深度
+        epi_stage = epilogue 里 register -> SMEM -> GMEM store 的 pipeline 深度
+        """        
         self.epi_stage = None
 
         self.a_smem_layout_staged = None
@@ -325,8 +399,8 @@ class HopperWgmmaGemmKernel:
         self.epi_smem_layout_staged = None
         self.epi_tile = None
 
-        self.shared_storage = None
-        self.buffer_align_bytes = 1024
+        self.shared_storage = None # 可能需要从smem_capacity开始
+        self.buffer_align_bytes = 1024 # alignas(1024)
 
     # 函数 HopperWgmmaGemmKernel._setup_attributes：根据实际输入 tensor 的 dtype/layout 派生 tiled_mma、K
     # tile、multicast、epilogue tile、pipeline stage 和 SMEM layout。 参数：self；返回：未显式标注。
@@ -342,9 +416,15 @@ class HopperWgmmaGemmKernel:
         - Computing epilogue subtile
         - Setting up A/B/C stage counts in shared memory
         - Computing A/B/C shared memory layout
+
+        中文说明：
+        根据输入 tensor 的 dtype/layout 和 kernel 配置派生运行所需属性：创建 tiled MMA，确定 K tile，
+        计算 cluster layout 和 A/B multicast 数量，选择 epilogue tile，估算 A/B 与 epilogue 的 pipeline stage，
+        并生成 A/B/C 在 shared memory 中的 staged layout。
         """
 
         # check the cta tile shape
+        # 检查 CTA tile shape 是否落在该示例支持的范围内。
         if self.tile_shape_mnk[0] not in [64, 128]:
             # 遇到不支持的 dtype/layout/alignment 或运行环境时主动报错，避免继续生成非法 kernel。
             raise ValueError("CTA tile shape M must be 64/128")
@@ -360,28 +440,30 @@ class HopperWgmmaGemmKernel:
             self.b_layout.sm90_mma_major_mode(),
             self.acc_dtype,
             self.atom_layout_mnk,
-            tiler_mn=(64, self.tile_shape_mnk[1]),
+            tiler_mn=(64, self.tile_shape_mnk[1]), #疑问： 这个地方self.tile_shape_mnk[0]?
         )
-        mma_inst_shape_k = cute.size(self.tiled_mma.shape_mnk, mode=[2])
-        mma_inst_tile_k = 4
-        self.tile_shape_mnk = (
+        mma_inst_shape_k = cute.size(self.tiled_mma.shape_mnk, mode=[2]) # 取哪一个维度， mnk, 则m是mode0, k是mode2
+        
+        mma_inst_tile_k = 4 # inst: instruction
+        self.tile_shape_mnk = ( # BM, BN, BK
             self.tile_shape_mnk[0],
             self.tile_shape_mnk[1],
             mma_inst_shape_k * mma_inst_tile_k,
         )
 
-        self.cta_layout_mnk = cute.make_layout((*self.cluster_shape_mn, 1))
-        self.num_mcast_ctas_a = self.cluster_shape_mn[1]
+        self.cta_layout_mnk = cute.make_layout((*self.cluster_shape_mn, 1)) # make layout 比较关键
+        self.num_mcast_ctas_a = self.cluster_shape_mn[1] # 疑问：不是应该a * b吗，为什么self.cluster_shape_mn[1]对应ctas_a
         self.num_mcast_ctas_b = self.cluster_shape_mn[0]
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
-        is_cooperative = self.atom_layout_mnk == (2, 1, 1)
+        is_cooperative = self.atom_layout_mnk == (2, 1, 1) # cooperative 在90 系列下的意思就是，>1个warp group 用于处理计算部分
         self.epi_tile = sm90_utils.compute_tile_shape_or_override(
             self.tile_shape_mnk, self.c_dtype, is_cooperative=is_cooperative
         )
 
         # Compute stage before compute smem layout
+        # 先计算 pipeline stage 数，再根据 stage 维生成 shared-memory layout。
         # 下面根据 tile 大小、dtype 位宽和共享内存容量计算 pipeline stage 数；A/B stage 决定 mainloop 预取深度，epilogue stage
         # 决定写回缓冲数量。
         self.ab_stage, self.epi_stage = self._compute_stages(
@@ -394,10 +476,11 @@ class HopperWgmmaGemmKernel:
 
         # 下面一次性生成 A/B/epilogue 的 staged shared-memory layout；返回值按 A、B、C 写回顺序解包到实例属性，后续
         # TMA/WGMMA/epilogue 都会复用这些 layout。
+        # 疑问： 什么情况下epilogue需要smem来存一些东西。
         (
             self.a_smem_layout_staged,
-            self.b_smem_layout_staged,
-            self.epi_smem_layout_staged,
+            self.b_smem_layout_staged, # A/B 的 global -> shared -> WGMMA
+            self.epi_smem_layout_staged, # accumulator -> shared -> global C
         ) = self._make_smem_layouts(
             self.tile_shape_mnk,
             self.epi_tile,
@@ -422,7 +505,7 @@ class HopperWgmmaGemmKernel:
         stream: cuda.CUstream,
     ):
         """Execute the GEMM operation in steps:
-        - Setup static attributes
+        - Setup static attributes, 静态的属性
         - Setup TMA load/store atoms and tensors
         - Compute grid size
         - Define shared storage for kernel
@@ -436,17 +519,23 @@ class HopperWgmmaGemmKernel:
         :type c: cute.Tensor
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
+
+        中文说明：
+        执行 GEMM 的 host/JIT 入口：先记录 A/B/C 的 dtype 和 layout，再完成合法性检查，创建 TMA load/store
+        atom 与 tensor 视图，计算 launch grid，定义 shared storage，最后同步 launch device kernel。
         """
 
         # setup static attributes before smem/grid/tma computation
+        # 在计算 SMEM/grid/TMA 之前，先记录输入 tensor 决定的静态属性。
         self.a_dtype = a.element_type
         self.b_dtype = b.element_type
         self.c_dtype = c.element_type
-        self.a_layout = utils.LayoutEnum.from_tensor(a)
+        self.a_layout = utils.LayoutEnum.from_tensor(a) # 看是row major还是column major
         self.b_layout = utils.LayoutEnum.from_tensor(b)
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
-        if cutlass.const_expr(
+        if cutlass.const_expr( # a_dtype.width: bytes数
+            # 编译器常量                            
             self.a_dtype.width == 16 and self.a_dtype != self.b_dtype
         ):
             # 遇到不支持的 dtype/layout/alignment 或运行环境时主动报错，避免继续生成非法 kernel。
@@ -494,13 +583,19 @@ class HopperWgmmaGemmKernel:
         class SharedStorage:
             mainloop_pipeline_array_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.ab_stage * 2
-            ]
+            ] # barrier, int64
             sA: cute.struct.Align[
                 cute.struct.MemRange[
                     self.a_dtype, cute.cosize(self.a_smem_layout_staged)
-                ],
+                ], # 需要用cosize，定义物理存储大小
                 self.buffer_align_bytes,
             ]
+            """
+            cute.struct.MemRange[T, N] 就是在 struct 里声明“一段 T 类型、长度 N 的连续内存”，
+            常用于 shared memory buffer；用 .data_ptr() 拿指针，用 .get_tensor(layout) 把它
+            解释成 CuTe tensor。
+            """
+            
             sB: cute.struct.Align[
                 cute.struct.MemRange[
                     self.b_dtype, cute.cosize(self.b_smem_layout_staged)
@@ -511,6 +606,7 @@ class HopperWgmmaGemmKernel:
         self.shared_storage = SharedStorage
 
         # Launch the kernel synchronously
+        # 同步 launch kernel；这里会等 kernel launch 相关操作完成。
         # 下面是一个多行函数调用；用一段注释解释整个调用，参数行保持干净以便对照源码。
         self.kernel(
             tma_atom_a,
@@ -520,8 +616,8 @@ class HopperWgmmaGemmKernel:
             tma_atom_c,
             tma_tensor_c,
             self.tiled_mma,
-            self.cta_layout_mnk,
-            self.a_smem_layout_staged,
+            self.cta_layout_mnk, # cluster level
+            self.a_smem_layout_staged, # 
             self.b_smem_layout_staged,
             self.epi_smem_layout_staged,
         ).launch(
@@ -533,6 +629,7 @@ class HopperWgmmaGemmKernel:
         return
 
     #  GPU device kernel
+    #  GPU device kernel 主体
     # 函数 HopperWgmmaGemmKernel.kernel：GPU device kernel：定位输出 tile，初始化 TMA pipeline，加载 A/B，执行 WGMMA
     # mainloop，再通过 epilogue 写回 C。 参数：self, tma_atom_a, mA_mkl, tma_atom_b, mB_nkl, tma_atom_c,
     # mC_mnl, tiled_mma, cta_layout_mnk, a_smem_layout_staged, b_smem_layout_staged,
@@ -541,8 +638,8 @@ class HopperWgmmaGemmKernel:
     def kernel(
         self,
         tma_atom_a: cute.CopyAtom,
-        mA_mkl: cute.Tensor,
-        tma_atom_b: cute.CopyAtom,
+        mA_mkl: cute.Tensor, # tma_tensor: GMEM和tma单元之间的坐标映射
+        tma_atom_b: cute.CopyAtom, 
         mB_nkl: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
@@ -577,41 +674,77 @@ class HopperWgmmaGemmKernel:
         :type b_smem_layout_staged: cute.ComposedLayout
         :param epi_smem_layout_staged: Shared memory layout for epilogue
         :type epi_smem_layout_staged: cute.ComposedLayout
+
+        中文说明：
+        GPU device kernel 的主体：每个 CTA 定位自己的输出 tile，预取 TMA descriptor，初始化 A/B load pipeline
+        和 C store pipeline；mainloop 中用 TMA 把 A/B 搬到 SMEM，再用 WGMMA 累加到寄存器；epilogue 阶段
+        把 accumulator 写入 SMEM，并通过 TMA store 写回 GMEM。
         """
 
         warp_idx = cute.arch.warp_idx()
-        warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        # 补充： tidx, tidy, tidz = cute.arch.thread_idx()
+        # lane_idx = cute.arch.lane_idx()
+        
+        # 如果要thread_idx.
+        # tidx, tidy, tidz = cute.arch.thread_idx()
+        # bdimx, bdimy, _ = cute.arch.block_dim()
+        # linear_tid = tidx + tidy * bdimx + tidz * bdimx * bdimy
+        warp_idx = cute.arch.make_warp_uniform(warp_idx) # 显式告诉编译器，一个warp内warp_idx应该是一样的，避免把它当成 lane-divergent 分支处理。
+        # 最好就和一般的warp_idx（）一起用
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Prefetch Tma desc
+        #  预取 TMA descriptor
         # /////////////////////////////////////////////////////////////////////////////
         # 按 warp 编号分配轻量控制工作，例如预取 TMA descriptor、发起 TMA copy 或执行 epilogue store。
         if warp_idx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
+            # 疑问：为什么只拿ab，不拿c？？ 因为
+            """
+            dense GEMM 的 C descriptor 是“晚点用的固定 store descriptor”；grouped GEMM 的 C descriptor
+            是“persistent/group 切换流程里会初始化、更新、反复 store 的动态 tensormap descriptor”，所以提
+            前 prefetch C 更有收益，也更稳妥。
+            """
+            
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Get cta/warp/thread idx
+        #  获取 CTA、warp 和 thread 的索引
         # ///////////////////////////////////////////////////////////////////////////////
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
-
+        # 疑问：如果cluster是(1,1) 此时cidx的swizzle还有用吗？
+        # 解答： 有用，当cluster(1,1)时， cid~= bid
         cidx, cidy, _ = cute.arch.cluster_idx()
         cdimx, cdimy, _ = cute.arch.cluster_dim()
         cluster_id = cidx + cdimx * cidy
 
         # CTA Swizzle to promote L2 data reuse
+        # 对 CTA 坐标做 swizzle，提高 L2 数据复用。
+        # 注意，这里做的是cluster级别的swizzle，cluster(1,1)时，就是block级别
+        # cid swizzle 的依据就是 GPU 对线性 block/cluster id 的发射顺序具有近似时间局部性；
+        # swizzle 把这种“编号局部性”转换成 A/B 数据访问局部性。
         group_size_m = 8
         s_shape = (
-            (group_size_m, cdimx // group_size_m),
+            (group_size_m, cdimx // group_size_m), # 相当于把第一维的layout加了一层， ((m_in_group, m_group), n)
             cdimy,
         )
-        s_stride = ((1, cdimy * group_size_m), group_size_m)
+        s_stride = ((1, cdimy * group_size_m), group_size_m) # 因为复用目标是a、b tile，因此需要m 0-7后，重复n，即此时，n是第二维
         s_layout = cute.make_layout(s_shape, stride=s_stride)
         num_reg_cids = cute.size(s_shape)
         cid_m, cid_n = s_layout.get_flat_coord(cluster_id % num_reg_cids)
+        # 一维坐标翻译成s_layout多维坐标： get_flat_coord
+        # 多维转一维： linear = s_layout(coord)
+        # layout(coord)          : 多维坐标 -> 线性 offset
+        # layout.get_flat_coord(i): 线性 offset -> 多维坐标
+        # 疑问：如果出现cluster_size // num_reg_cids >0 怎么办？
+        
+        
+        
 
         # Deal with the tail part
+        # 处理 M/N 维尾块，避免越界访问。
         if cluster_id >= num_reg_cids:
             tail_size_m = cdimx % group_size_m
             tail_layout = cute.make_layout(
@@ -623,6 +756,7 @@ class HopperWgmmaGemmKernel:
             cid_n = tail_cid_n
 
         # Get the pid from cluster id
+        # 根据 cluster id 计算当前 CTA 对应的 tile id。
         bidx_in_cluster = cute.arch.block_in_cluster_idx()
         pid_m = cid_m * self.cluster_shape_mn[0] + bidx_in_cluster[0]
         pid_n = cid_n * self.cluster_shape_mn[1] + bidx_in_cluster[1]
@@ -635,6 +769,7 @@ class HopperWgmmaGemmKernel:
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get mcast mask
+        # 生成 TMA multicast mask，决定数据广播给 cluster 内哪些 CTA。
         # ///////////////////////////////////////////////////////////////////////////////
         a_mcast_mask = cute.make_layout_image_mask(
             cta_layout_mnk, cluster_coord_mnk, mode=1
@@ -653,18 +788,22 @@ class HopperWgmmaGemmKernel:
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Alloc and init AB full/empty + ACC full mbar (pipeline)
+        #  分配并初始化 A/B full/empty barrier，以及 accumulator/epilogue 相关 barrier。
         # /////////////////////////////////////////////////////////////////////////////
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # mbar arrays
+        # mbar 数组保存各个 pipeline stage 的 barrier。
         mainloop_pipeline_array_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
 
         # Threads/warps participating in this pipeline
+        # 定义参与该 pipeline 的线程数/warp 数。
         mainloop_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread
         )
         # Each warp will constribute to the arrive count with the number of mcast size
+        # 每个 warp 对 arrive count 的贡献会乘上 multicast 的 CTA 数量。
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         num_warps = self.threads_per_cta // 32
         consumer_arrive_cnt = mcast_size * num_warps
@@ -685,11 +824,13 @@ class HopperWgmmaGemmKernel:
         )
 
         #  Cluster arrive after barrier init
+        #  barrier 初始化后，cluster 内 CTA 做一次 arrive 同步。
         # cluster 内 CTA 到达 pipeline 初始化同步点，确保 barrier 初始化过程可见。
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Generate smem tensor A/B
+        #  根据 shared storage 和 layout 构造 A/B 的 SMEM tensor。
         # ///////////////////////////////////////////////////////////////////////////////
         sA = storage.sA.get_tensor(
             a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
@@ -704,6 +845,7 @@ class HopperWgmmaGemmKernel:
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Local_tile partition global tensors
+        #  从 global tensor 中切出当前 CTA/cluster 负责的 tile。
         # ///////////////////////////////////////////////////////////////////////////////
         # (bM, bK, RestK)
         # 从全局 tensor 中切出当前 tile/所有 tile 的局部视图，避免手写 M/N/K/L 索引计算。
@@ -723,6 +865,7 @@ class HopperWgmmaGemmKernel:
 
         # //////////////////////////////////////////////////////////////////////////////
         #  Partition global tensor for TiledMMA_A/B/C
+        #  按 TiledMMA 视角对 global tensor 做分区。
         # //////////////////////////////////////////////////////////////////////////////
         warp_group_idx = cute.arch.make_warp_uniform(
             tidx // self.num_threads_per_warp_group
@@ -736,8 +879,10 @@ class HopperWgmmaGemmKernel:
 
         # //////////////////////////////////////////////////////////////////////////////
         #  Partition shared tensor for TMA load A/B
+        #  按 TMA load 需求对 shared tensor 做分区。
         # //////////////////////////////////////////////////////////////////////////////
         #  TMA load A partition_S/D
+        #  为 A 的 TMA load 创建源端 S 和目的端 D 分区。
         a_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (0, None, 0)).shape)
         a_cta_crd = cluster_coord_mnk[1]
         sA_for_tma_partition = cute.group_modes(sA, 0, 2)
@@ -752,6 +897,7 @@ class HopperWgmmaGemmKernel:
         )
 
         # TMA load B partition_S/D
+        # 为 B 的 TMA load 创建源端 S 和目的端 D 分区。
         b_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
         b_cta_crd = cluster_coord_mnk[0]
         sB_for_tma_partition = cute.group_modes(sB, 0, 2)
@@ -767,6 +913,7 @@ class HopperWgmmaGemmKernel:
 
         # //////////////////////////////////////////////////////////////////////////////
         #  Make fragments
+        #  创建寄存器 fragment，包括 accumulator 和临时寄存器视图。
         # //////////////////////////////////////////////////////////////////////////////
         tCsA = thr_mma.partition_A(sA)
         tCsB = thr_mma.partition_B(sB)
@@ -779,12 +926,15 @@ class HopperWgmmaGemmKernel:
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Cluster wait
+        #  等待 cluster 级同步完成。
         # ///////////////////////////////////////////////////////////////////////////////
         # cluster wait for barrier init
+        # 等待 barrier 初始化在 cluster 内可见。
         # 等待 pipeline 初始化完成，避免在 barrier 未准备好时开始 producer/consumer 操作。
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
         # /////////////////////////////////////////////////////////////////////////////
         #  Prefetch
+        #  mainloop 前的预取阶段。
         # /////////////////////////////////////////////////////////////////////////////
         k_tile_cnt = cute.size(gA_mkl, mode=[2])
         prefetch_k_tile_cnt = cutlass.max(cutlass.min(self.ab_stage, k_tile_cnt), 0)
@@ -796,16 +946,20 @@ class HopperWgmmaGemmKernel:
         if warp_idx == 0:
             # /////////////////////////////////////////////////////////////////////////////
             # Prefetch TMA load
+            # 预取首批 TMA load。
             # /////////////////////////////////////////////////////////////////////////////
             for prefetch_idx in cutlass.range(prefetch_k_tile_cnt, unroll=1):
                 # /////////////////////////////////////////////////////////////////////////////
                 #  Wait for A/B buffers to be empty before loading into them
+                #  写入 A/B buffer 前，先等待对应 pipeline stage 为空。
                 #  Also sets the transaction barrier for the A/B buffers
+                #  同时设置 A/B buffer 对应的 transaction barrier。
                 # /////////////////////////////////////////////////////////////////////////////
                 # producer 等待目标 pipeline stage 变空，准备把新的 A/B tile 通过 TMA 搬入 shared memory。
                 mainloop_pipeline.producer_acquire(mainloop_producer_state)
                 # /////////////////////////////////////////////////////////////////////////////
                 #  Slice to global/shared memref to current k_tile
+                #  切出当前 k_tile 对应的 global/shared memref。
                 # /////////////////////////////////////////////////////////////////////////////
                 tAgA_k = tAgA_mkl[(None, mainloop_producer_state.count)]
                 tAsA_pipe = tAsA[(None, mainloop_producer_state.index)]
@@ -815,6 +969,7 @@ class HopperWgmmaGemmKernel:
 
                 # /////////////////////////////////////////////////////////////////////////////
                 #  TMA load A/B
+                #  发起 A/B 的 TMA load。
                 # /////////////////////////////////////////////////////////////////////////////
                 # 执行 CuTe copy；根据上下文可能是 TMA load、TMA store 或寄存器到 shared memory 的 copy。
                 cute.copy(
@@ -837,12 +992,14 @@ class HopperWgmmaGemmKernel:
                     mcast_mask=b_mcast_mask,
                 )
                 # Mainloop pipeline's producer commit is a NOP
+                # mainloop pipeline 的 producer commit 在这里是空操作，但保留统一的 pipeline 语义。
                 # producer 提交当前 pipeline stage；TMA async pipeline 中它主要推进状态语义。
                 mainloop_pipeline.producer_commit(mainloop_producer_state)
                 mainloop_producer_state.advance()
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Prologue MMAs
+        #  prologue 阶段先发起一批 MMA，填充 WGMMA pipeline。
         # /////////////////////////////////////////////////////////////////////////////
         k_pipe_mmas = 1
 
@@ -864,6 +1021,7 @@ class HopperWgmmaGemmKernel:
         # 沿 K 维 tile 迭代 mainloop；每轮消费一个 K tile 的 A/B 数据并贡献一部分矩阵乘加。
         for k_tile in cutlass.range_constexpr(k_pipe_mmas):
             # Wait for A/B buffer to be ready
+            # 等待 A/B buffer 中的数据准备好。
             # consumer 等待当前 pipeline stage 的 TMA load 完成，确保 WGMMA 读取有效的 shared-memory 数据。
             mainloop_pipeline.consumer_wait(
                 mainloop_consumer_read_state, peek_ab_full_status
@@ -902,11 +1060,13 @@ class HopperWgmmaGemmKernel:
 
         # /////////////////////////////////////////////////////////////////////////////
         #  MAINLOOP
+        #  主循环
         # /////////////////////////////////////////////////////////////////////////////
         # 沿 K 维 tile 迭代 mainloop；每轮消费一个 K tile 的 A/B 数据并贡献一部分矩阵乘加。
         for k_tile in cutlass.range(k_pipe_mmas, k_tile_cnt, 1, unroll=1):
             # /////////////////////////////////////////////////////////////////////////////
             #  Wait for TMA copies to complete
+            #  等待当前 stage 的 TMA copy 完成。
             # /////////////////////////////////////////////////////////////////////////////
             # consumer 等待当前 pipeline stage 的 TMA load 完成，确保 WGMMA 读取有效的 shared-memory 数据。
             mainloop_pipeline.consumer_wait(
@@ -914,6 +1074,7 @@ class HopperWgmmaGemmKernel:
             )
             # /////////////////////////////////////////////////////////////////////////////
             #  WGMMA
+            #  发起当前 K tile 内的 WGMMA。
             # /////////////////////////////////////////////////////////////////////////////
             cute.nvgpu.warpgroup.fence()
             # 遍历当前 K tile 内的 WGMMA K-block；每个 block 发起一次 CuTe GEMM/WGMMA。
@@ -939,6 +1100,7 @@ class HopperWgmmaGemmKernel:
             # 提交当前 WGMMA group，让异步矩阵乘加进入执行队列。
             cute.nvgpu.warpgroup.commit_group()
             # Wait on the wgmma barrier for previous k_pipe_mmas wgmmas to complete
+            # 等待前面提交的一批 WGMMA 完成。
             # 等待 WGMMA group 完成；在读取 accumulator 或释放 buffer 前必须保证写入结束。
             cute.nvgpu.warpgroup.wait_group(k_pipe_mmas)
 
@@ -961,13 +1123,16 @@ class HopperWgmmaGemmKernel:
             if warp_idx == 0 and mainloop_producer_state.count < k_tile_cnt:
                 # /////////////////////////////////////////////////////////////////////////////
                 #  Wait for A/B buffers to be empty before loading into them
+                #  写入 A/B buffer 前，先等待对应 pipeline stage 为空。
                 #  Also sets the transaction barrier for the A/B buffers
+                #  同时设置 A/B buffer 对应的 transaction barrier。
                 # /////////////////////////////////////////////////////////////////////////////
                 # producer 等待目标 pipeline stage 变空，准备把新的 A/B tile 通过 TMA 搬入 shared memory。
                 mainloop_pipeline.producer_acquire(mainloop_producer_state)
 
                 # /////////////////////////////////////////////////////////////////////////////
                 #  Slice to global/shared memref to current k_tile
+                #  切出当前 k_tile 对应的 global/shared memref。
                 # /////////////////////////////////////////////////////////////////////////////
                 tAgA_k = tAgA_mkl[(None, mainloop_producer_state.count)]
                 tAsA_pipe = tAsA[(None, mainloop_producer_state.index)]
@@ -977,6 +1142,7 @@ class HopperWgmmaGemmKernel:
 
                 # /////////////////////////////////////////////////////////////////////////////
                 #  TMA load A/B
+                #  发起 A/B 的 TMA load。
                 # /////////////////////////////////////////////////////////////////////////////
                 # 执行 CuTe copy；根据上下文可能是 TMA load、TMA store 或寄存器到 shared memory 的 copy。
                 cute.copy(
@@ -999,24 +1165,30 @@ class HopperWgmmaGemmKernel:
                     mcast_mask=b_mcast_mask,
                 )
                 # Mainloop pipeline's producer commit is a NOP
+                # mainloop pipeline 的 producer commit 在这里是空操作，但保留统一的 pipeline 语义。
                 # producer 提交当前 pipeline stage；TMA async pipeline 中它主要推进状态语义。
                 mainloop_pipeline.producer_commit(mainloop_producer_state)
                 mainloop_producer_state.advance()
 
         # /////////////////////////////////////////////////////////////////////////////
         #  EPILOG
+        #  epilogue 写回阶段
         # /////////////////////////////////////////////////////////////////////////////
         # 等待 WGMMA group 完成；在读取 accumulator 或释放 buffer 前必须保证写入结束。
         cute.nvgpu.warpgroup.wait_group(0)
 
         if cute.size(self.cluster_shape_mn) > 1:
             # Wait for all threads in the cluster to finish, avoid early release of smem
+            # 等待 cluster 内所有线程完成，避免过早释放或复用 SMEM。
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
         else:
             # For cluster that has a single thread block, it might have more than one warp groups.
+            # 即使 cluster 只有一个 CTA，一个 CTA 内也可能有多个 warp group。
             # Wait for all warp groups in the thread block to finish, because smem for tensor A in
+            # 等待 CTA 内所有 warp group 完成，因为 mainloop 中 A 使用的 SMEM 会在 epilogue 中复用。
             # the mainloop is reused in the epilogue.
+            # 上一行说明的是 mainloop SMEM 与 epilogue SMEM 的复用关系。
             cute.arch.sync_threads()
 
         copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
@@ -1047,6 +1219,7 @@ class HopperWgmmaGemmKernel:
         tRS_rAcc = tiled_copy_r2s.retile(accumulators)
 
         # Allocate D registers.
+        # 分配 D 寄存器，用于存放转换后的输出片段。
         rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
         tRS_rD_layout = cute.make_layout(rD_shape[:3])
         # 创建寄存器 tensor，通常用于 accumulator、临时 accumulator 或 epilogue 类型转换缓冲。
@@ -1072,6 +1245,7 @@ class HopperWgmmaGemmKernel:
         )
 
         # Initialize tma store c_pipeline
+        # 初始化 C 的 TMA store pipeline。
         c_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, self.threads_per_cta
         )
@@ -1084,17 +1258,20 @@ class HopperWgmmaGemmKernel:
         # 遍历 epilogue 子 tile，把 accumulator 分块转换、写入 shared memory，再通过 TMA store 写回输出。
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
             # Copy from accumulators to D registers
+            # 从 accumulator 拷贝到 D 寄存器。
             # 遍历 epilogue 子 tile，把 accumulator 分块转换、写入 shared memory，再通过 TMA store 写回输出。
             for epi_v in cutlass.range_constexpr(size_tRS_rD):
                 tRS_rD[epi_v] = tRS_rAcc[epi_idx * size_tRS_rD + epi_v]
 
             # Type conversion
+            # 做 accumulator dtype 到输出 dtype 的类型转换。
             # 创建寄存器 tensor，通常用于 accumulator、临时 accumulator 或 epilogue 类型转换缓冲。
             tRS_rD_out = cute.make_rmem_tensor_like(tRS_rD_layout, self.c_dtype)
             acc_vec = tRS_rD.load()
             tRS_rD_out.store(acc_vec.to(self.c_dtype))
 
             # Copy from D registers to shared memory
+            # 将 D 寄存器中的结果写入 shared memory。
             epi_buffer = epi_idx % cute.size(tRS_sD, mode=[3])
             # 执行 CuTe copy；根据上下文可能是 TMA load、TMA store 或寄存器到 shared memory 的 copy。
             cute.copy(
@@ -1107,10 +1284,12 @@ class HopperWgmmaGemmKernel:
                 space="cta",
             )
             # barrier for sync
+            # 用 barrier 同步，保证 SMEM 中的数据可被 TMA store 安全读取。
             pipeline.sync(barrier_id=1)
 
             gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
             # Copy from shared memory to global memory
+            # 使用 TMA store 将结果从 shared memory 写回 global memory。
             # 按 warp 编号分配轻量控制工作，例如预取 TMA descriptor、发起 TMA copy 或执行 epilogue store。
             if warp_idx == 0:
                 # 执行 CuTe copy；根据上下文可能是 TMA load、TMA store 或寄存器到 shared memory 的 copy。
@@ -1136,6 +1315,9 @@ class HopperWgmmaGemmKernel:
     # 函数 HopperWgmmaGemmKernel._compute_stages：根据 tile shape、dtype 宽度、SMEM 容量和 occupancy 估算 A/B
     # pipeline stage 数。 参数：tile_shape_mnk, a_dtype, b_dtype, smem_capacity, occupancy；返回：tuple[int,
     # int]。
+    # 通常如何估算一个gemm需要的stages数量？ 总的smem。 每个阶段tma的量，包括a/b矩阵的bm，bn，bk大小，最后的c矩阵的大小，
+    # 以及中间可能能复用的smem。不要spill
+    # NOTE: 需要关注epi_tile 的影响
     @staticmethod
     def _compute_stages(
         tile_shape_mnk: tuple[int, int, int],
@@ -1160,34 +1342,42 @@ class HopperWgmmaGemmKernel:
         :return: A tuple containing the computed number of stages for:
                  (A/B operand stages, epilogue stages)
         :rtype: tuple[int, int]
+
+        中文说明：
+        根据 CTA tile 大小、A/B dtype 位宽、shared-memory 容量和目标 occupancy，估算 A/B mainloop 可以放下
+        多少个 pipeline stage；epilogue stage 在这里固定为 4，并假设 epilogue SMEM 复用 A/B 的空间。
         """
 
+        # 一般情况下，epi阶段可以直接使用前面a/b的smem
         epi_stage = 4
         # epi_smem will reuse smem ab.
-        epi_bytes = 0
+        # epilogue 的 SMEM 会复用 A/B mainloop 的 SMEM 空间。
+        epi_bytes = 0 # 疑问：为什么是0？
 
-        a_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
-        b_shape = cute.slice_(tile_shape_mnk, (0, None, None))
+        a_shape = cute.slice_(tile_shape_mnk, (None, 0, None)) # bm, bk
+        b_shape = cute.slice_(tile_shape_mnk, (0, None, None)) # bn, bk
         ab_bytes_per_stage = (
-            cute.size(a_shape) * a_dtype.width // 8
+            cute.size(a_shape) * a_dtype.width // 8 #  cute.size通常来算总和， // 8的原因是，求的是bytes，不是bits
             + cute.size(b_shape) * b_dtype.width // 8
         )
-        mbar_helpers_bytes = 1024
+        mbar_helpers_bytes = 1024 # barrier，通常是一个stage一个barrier， 通常 1 个 mbarrier = 1 个 Int64 = 8 bytes
 
         ab_stage = (
             smem_capacity // occupancy - mbar_helpers_bytes - epi_bytes
-        ) // ab_bytes_per_stage
+        ) // ab_bytes_per_stage # 疑问： 最后结果不需要暂存？所以只需要ab size即可？ 解答： 可能只需要一个accumulator
         return ab_stage, epi_stage
 
     # 函数 HopperWgmmaGemmKernel._make_smem_layouts：创建 A、B 和 epilogue C 的 staged shared-memory layout。
     # 参数：tile_shape_mnk, epi_tile, a_dtype, a_layout, b_dtype, b_layout, ab_stage, c_dtype,
     # c_layout, epi_stage；返回：tuple[cute.ComposedLayout, cute.ComposedLayout, cute.ComposedLayout]。
+    # 注意： 这里就是为了tma和计算对应的layout
     @staticmethod
     def _make_smem_layouts(
-        tile_shape_mnk: tuple[int, int, int],
-        epi_tile: tuple[int, int],
-        a_dtype: type[cutlass.Numeric],
-        a_layout: utils.LayoutEnum,
+        tile_shape_mnk: tuple[int, int, int], # BM, BN, BK
+        epi_tile: tuple[int, int], # 大概率是BM, BN
+        a_dtype: type[cutlass.Numeric], # 注意： 输入tensor的dtype是cutlass.Numeric
+        a_layout: utils.LayoutEnum, # 注意： layout通常是row-major或者column-major
+        # 疑问： 为什么cute多数是column - major
         b_dtype: type[cutlass.Numeric],
         b_layout: utils.LayoutEnum,
         ab_stage: int,
@@ -1220,6 +1410,10 @@ class HopperWgmmaGemmKernel:
 
         :return: Tuple of shared memory layouts for A, B, and C
         :rtype: Tuple[cute.ComposedLayout, cute.ComposedLayout, cute.ComposedLayout]
+
+        中文说明：
+        为 A、B 和 epilogue C 分别创建 shared-memory layout。A/B layout 用于 TMA load 和 WGMMA 读取，
+        C 的 epilogue layout 用于 accumulator 先落到 SMEM，再由 TMA store 写回 GMEM。返回的 layout 都带 stage 维。
         """
         a_smem_layout_staged = sm90_utils.make_smem_layout_a(
             a_layout,
@@ -1263,13 +1457,19 @@ class HopperWgmmaGemmKernel:
 
         :return: Grid shape for kernel launch.
         :rtype: tuple[int, int, int]
+
+        中文说明：
+        按 CTA tile shape 将输出 C 切成 tile，再按 cluster shape 对 tile grid 做分组，最终得到 kernel launch
+        使用的三维 grid。第三维通常对应 batch 维 L。
+        这里的 grid 基本就是“所有 CTA tile 的网格”；在这个 dense GEMM 中，一个 CTA 负责一个输出 tile BM x BN，
+        但 grid 会按 cluster 尺寸向上补齐。
         """
 
         c_shape = (tile_shape_mnk[0], tile_shape_mnk[1])
-        gc = cute.zipped_divide(c, tiler=c_shape)
+        gc = cute.zipped_divide(c, tiler=c_shape) # 用的是zipped divide, 结果是(tile内的坐标， tile的坐标)
         cluster_shape_mnl = (*cluster_shape_mn, 1)
-        clusters = cute.ceil_div(cute.get(gc.layout, mode=[1]).shape, cluster_shape_mnl)
-        grid = tuple(x * y for x, y in zip(clusters, cluster_shape_mnl))
+        clusters = cute.ceil_div(cute.get(gc.layout, mode=[1]).shape, cluster_shape_mnl)# tile的坐标， 结果是cluster的每个维度有多少个cluster group
+        grid = tuple(x * y for x, y in zip(clusters, cluster_shape_mnl)) #  #cluster_group_count * #tiles_in_clusters
         return grid
 
     # 函数 HopperWgmmaGemmKernel._make_tma_store_atoms_and_tensors：创建 C 的 TMA shared-to-global store
@@ -1292,6 +1492,10 @@ class HopperWgmmaGemmKernel:
 
         :return: TMA atom and tensor for C
         :rtype: Tuple[cute.CopyAtom, cute.Tensor]
+
+        中文说明：
+        创建 C 的 TMA store atom 和对应 tensor 视图。这里使用 shared-to-global 的 bulk tensor tile store，
+        负责把 epilogue 阶段暂存在 SMEM 中的 C tile 写回 global memory。
         """
         epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
         # 下面是一次多返回值解包：把右侧计算结果拆成 (tma_atom_c, tma_tensor_c)，多行参数保持原代码结构，不逐行解释。
@@ -1327,6 +1531,10 @@ class HopperWgmmaGemmKernel:
 
         :return: TMA atom and tensor
         :rtype: Tuple[cute.CopyAtom, cute.Tensor]
+
+        中文说明：
+        创建 A 或 B 的 TMA load atom 和 tensor 视图。普通情况使用 global-to-shared TMA copy；当 mcast_dim
+        大于 1 时使用 TMA multicast，让一个 CTA 发起的数据搬运可以被同一个 cluster 内多个 CTA 共享。
         """
         op = (
             cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
@@ -1343,6 +1551,8 @@ class HopperWgmmaGemmKernel:
             smem_tile,
             num_multicast=mcast_dim,
         )
+        # tma_atom:  # 一次 TMA 拷贝操作的 基础描述单元。包括metadata，以及一些具体的tensor
+        # tma_tensor: GMEM和tma单元之间的坐标映射
         return tma_atom, tma_tensor
 
     # 函数 HopperWgmmaGemmKernel.is_valid_dtypes：检查输入、累加和输出 dtype 组合，以及 8-bit 输入的 layout 约束。
@@ -1374,6 +1584,10 @@ class HopperWgmmaGemmKernel:
 
         :return: True if the dtypes are valid, False otherwise
         :rtype: bool
+
+        中文说明：
+        检查 A/B/C 和 accumulator 的 dtype 组合是否合法。重点约束包括：A/B 必须是支持的输入类型；
+        fp16 的 A/B dtype 必须相同；A/B 位宽必须相同；8-bit 输入只允许 k-major layout；整数输入使用 Int32 累加。
         """
         is_valid = True
 
@@ -1390,6 +1604,7 @@ class HopperWgmmaGemmKernel:
             is_valid = False
 
         # make sure a_dtype == b_dtype for Float16
+        # Float16 路径要求 A/B dtype 完全相同。
         if a_dtype.width == 16 and a_dtype != b_dtype:
             is_valid = False
         if a_dtype.width != b_dtype.width:
@@ -1398,12 +1613,14 @@ class HopperWgmmaGemmKernel:
             is_valid = False
 
         # for 8-bit types, this implementation only supports k-major layout
+        # 对 8-bit 类型，该实现只支持 k-major layout。
         if (a_dtype.width == 8 and a_major != "k") or (
             b_dtype.width == 8 and b_major != "k"
         ):
             is_valid = False
 
         # Define compatibility mapping between accumulator type and AB type
+        # 定义 accumulator dtype 与 A/B dtype 的兼容关系。
         acc_ab_compatibility = {
             cutlass.Float32: {
                 cutlass.Float16,
@@ -1418,10 +1635,12 @@ class HopperWgmmaGemmKernel:
             cutlass.Int32: {cutlass.Uint8, cutlass.Int8},
         }
         # Check compatibility between accumulator type and A type
+        # 检查 accumulator dtype 是否兼容 A dtype。
         if a_dtype not in acc_ab_compatibility[acc_dtype]:
             is_valid = False
 
         # Define compatibility mapping between accumulator type and C type
+        # 定义 accumulator dtype 与 C dtype 的兼容关系。
         acc_c_compatibility = {
             cutlass.Float32: {
                 cutlass.Float32,
@@ -1444,6 +1663,7 @@ class HopperWgmmaGemmKernel:
             },
         }
         # Check compatibility between accumulator type and C type
+        # 检查 accumulator dtype 是否兼容 C dtype。
         if c_dtype not in acc_c_compatibility[acc_dtype]:
             is_valid = False
 
@@ -1487,6 +1707,10 @@ class HopperWgmmaGemmKernel:
 
         :return: True if the problem shape is valid, False otherwise
         :rtype: bool
+
+        中文说明：
+        检查 A/B/C 的连续维是否满足 TMA 需要的 16B 对齐。这里根据 dtype 位宽算出 16 字节对应多少个元素，
+        再要求每个 tensor 的 major/contiguous 维长度是该元素数的整数倍。
         """
         is_valid = True
 
@@ -1560,6 +1784,11 @@ def run(
     :type use_cold_l2: bool, optional
     :return: Execution time of the GEMM kernel in microseconds
     :rtype: float
+
+    中文说明：
+    完整 host 示例入口：解析问题规模和 layout，创建 torch tensor 并转换成 CuTe tensor，构造/编译 kernel，
+    launch GPU GEMM；如果没有跳过参考校验，会用 torch 结果做正确性检查；最后按 warmup/iteration 参数做 benchmark，
+    返回 kernel 执行时间，单位是微秒。
     """
 
     import torch
@@ -1580,6 +1809,7 @@ def run(
     print(f"Use cold L2: {use_cold_l2}")
 
     # Unpack parameters
+    # 解包问题规模参数。
     m, n, k, l = mnkl
 
     # 运行前合法性检查：不支持的 dtype/layout/alignment 或无 GPU 环境会提前报错。
@@ -1607,17 +1837,21 @@ def run(
     torch.manual_seed(1111)
 
     # Create and permute tensor A/B/C
+    # 创建并按目标 layout 变换 A/B/C tensor。
     # 函数 run.create_and_permute_tensor：按目标 major layout 创建 tensor，转换成 CuTe tensor，并保留 f32 版本用于参考结果。
     # 参数：l, mode0, mode1, is_mode0_major, dtype, is_dynamic_layout；返回：未显式标注。
     def create_and_permute_tensor(
         l, mode0, mode1, is_mode0_major, dtype, is_dynamic_layout=True
     ):
         # is_mode0_major: (l, mode1, mode0) -> (mode0, mode1, l)
+        # 如果 mode0 是连续主维，先创建 (l, mode1, mode0)，再 permute 成 (mode0, mode1, l)。
         # else : (l, mode0, mode1) -> (mode0, mode1, l)
+        # 否则先创建 (l, mode0, mode1)，再 permute 成 (mode0, mode1, l)。
         shape = (l, mode1, mode0) if is_mode0_major else (l, mode0, mode1)
         permute_order = (2, 1, 0) if is_mode0_major else (1, 2, 0)
         is_unsigned = dtype in {cutlass.Uint8}
         # Temporarily use uint8 as torch does not support fp8 type
+        # torch 暂不直接支持 fp8 tensor 创建，这里临时用 uint8 承载 fp8 数据。
         torch_dtype = (
             cutlass_torch.dtype(dtype)
             if dtype not in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}
@@ -1625,6 +1859,7 @@ def run(
         )
 
         # Create dtype torch tensor (cpu)
+        # 在 CPU 上创建目标 dtype 的 torch tensor。
         torch_tensor_cpu = cutlass.torch.create_and_permute_torch_tensor(
             shape,
             torch_dtype,
@@ -1635,12 +1870,15 @@ def run(
             ),
         )
         # Create dtype torch tensor (gpu)
+        # 将目标 dtype tensor 搬到 GPU。
         torch_tensor = torch_tensor_cpu.cuda()
 
         # Create f32 torch tensor (cpu)
+        # 在 CPU 上保留 f32 版本，供参考计算或类型转换使用。
         f32_torch_tensor = torch_tensor_cpu.to(dtype=torch.float32)
 
         # Create dtype cute tensor (gpu)
+        # 从 GPU torch tensor 创建 CuTe tensor 视图。
         cute_tensor = from_dlpack(torch_tensor, assumed_align=16)
         cute_tensor.element_type = dtype
         if is_dynamic_layout:
@@ -1665,23 +1903,28 @@ def run(
     torch_stream = torch.cuda.current_stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
     # compile gemm kernel
+    # 编译 GEMM kernel。
     # 触发 CuTe DSL JIT 编译，把 Python kernel 描述和示例参数 specialize 成可 launch 的 CUDA kernel。
     compiled_gemm = cute.compile(gemm, mA, mB, mC, stream)
 
     # 根据命令行选项决定是否跳过参考校验；跳过会更快，但不会验证输出正确性。
     if not skip_ref_check:
         # execution
+        # 执行编译后的 kernel。
         compiled_gemm(mA, mB, mC, stream)
 
         torch.cuda.synchronize()
 
         # Ref check
+        # 参考结果校验。
         # 用 PyTorch 计算参考 GEMM 结果，用于和自定义 kernel 输出做数值校验。
         ref = (torch.einsum("mkl,nkl->mnl", a, b)).cpu()
 
         if c_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2):
             # m major: (l, n, m) -> (m, n, l)
+            # m-major 输出先按 (l, n, m) 创建，再 permute 到 (m, n, l)。
             # n major: (l, m, n) -> (m, n, l)
+            # n-major 输出先按 (l, m, n) 创建，再 permute 到 (m, n, l)。
             permute_order = (1, 2, 0) if c_major == "n" else (2, 1, 0)
             shape = (l, m, n) if c_major == "n" else (l, n, m)
             f8_torch_tensor = cutlass_torch.create_and_permute_torch_tensor(
