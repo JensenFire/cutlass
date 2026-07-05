@@ -39,6 +39,8 @@ class PipelineAsync:
     """PipelineAsync is a generic pipeline class where both the producer and consumer are
     AsyncThreads. It also serves as a base class for specialized pipeline classes.
 
+    疑问： 为什么需要两个barrier， 一个barrier能不能做到？
+
     This class implements a producer-consumer pipeline pattern where both sides operate
     asynchronously. The pipeline maintains synchronization state using barrier objects
     to coordinate between producer and consumer threads.
@@ -47,6 +49,22 @@ class PipelineAsync:
 
     .. table:: Pipeline State Transitions
        :widths: auto
+        疑问,重点： 什么时候empty.empty -> empty.wait, 两个完成任务的时候有barrier的state转换可以理解。
+        问题是empty->wait何时发生的？
+
+        每个角色：producer/consumer都有两个状态：等待前置条件完毕,开始任务/ 任务完成，标记，进入等待前置条件状态
+            - 对producer来说： 
+                - 任务：搬运data到buffer
+                - 前置条件：buffer空与否
+                - 如何判断前置条件(acquire)： 对偶阶段的任务完成，empty_barrier的state，需要是empty，不是empty就得等； 
+                - 完成任务后影响什么(commit)： full_barrier的state，->full，这样consumer才能执行任务
+
+            - 对consumer来说：
+                - 任务：消耗buffer的data
+                - 前置条件： buffer满与否
+                - 如何判断前置条件(wait): 对偶阶段的任务完成， full_barrier的state，需要是full，不是full就得等; 
+                - 完成任务后有什么影响(release)：empty_barrier的state，->empty，这样producer能执行任务
+
 
        +-----------+-----------+-----------+-----------+-----------+-----------+
        | Barrier   | State     | p.acquire | p.commit  | c.wait    | c.release |
@@ -266,7 +284,7 @@ class PipelineAsync:
             ),
             loc=loc,
             ip=ip,
-        )
+        ) # TODO: 解释这段code。
 
     @dsl_user_op
     def consumer_try_wait(
@@ -840,8 +858,8 @@ class PipelineOrder:
 @dataclass(frozen=True)
 class ImmutableResourceHandle:
     __origin: PipelineAsync
-    __immutable_state: PipelineState
-
+    __immutable_state: PipelineState # 如何理解这个immutable: 记录的是固定的pipeline state，不会随着producer/comsumer的主state变化
+    # 指向固定的stage
     def __init__(self, origin: PipelineAsync, immutable_state: PipelineState):
         self.__origin = origin  # type: ignore[misc]
         self.__immutable_state = immutable_state  # type: ignore[misc]

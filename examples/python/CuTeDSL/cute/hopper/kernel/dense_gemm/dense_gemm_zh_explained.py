@@ -696,7 +696,7 @@ class HopperWgmmaGemmKernel:
         #  Prefetch Tma desc
         #  预取 TMA descriptor
         # /////////////////////////////////////////////////////////////////////////////
-        # 按 warp 编号分配轻量控制工作，例如预取 TMA descriptor、发起 TMA copy 或执行 epilogue store。
+        # 按 warp 编号分配轻量控制工作，例如预取 TMA descriptor、发起 TMA copy 或执行 epilogue store。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                
         if warp_idx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
@@ -707,7 +707,7 @@ class HopperWgmmaGemmKernel:
             前 prefetch C 更有收益，也更稳妥。
             """
             
-
+                                                 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Get cta/warp/thread idx
         #  获取 CTA、warp 和 thread 的索引
@@ -718,7 +718,7 @@ class HopperWgmmaGemmKernel:
         # 解答： 有用，当cluster(1,1)时， cid~= bid
         cidx, cidy, _ = cute.arch.cluster_idx()
         cdimx, cdimy, _ = cute.arch.cluster_dim()
-        cluster_id = cidx + cdimx * cidy
+        cluster_id = cidx + cdimx * cidy #linear id
 
         # CTA Swizzle to promote L2 data reuse
         # 对 CTA 坐标做 swizzle，提高 L2 数据复用。
@@ -739,13 +739,18 @@ class HopperWgmmaGemmKernel:
         # layout(coord)          : 多维坐标 -> 线性 offset
         # layout.get_flat_coord(i): 线性 offset -> 多维坐标
         # 疑问：如果出现cluster_size // num_reg_cids >0 怎么办？
-        
+        # 假设是 cdimx, cdimy = 12,10, group_size = 8
+        # shape:（(8, 1), 10）. stride ((1,80), 8), 这样原本有120 tiles. 现在就剩80了
+        # 解决办法： 对尾部的块需要额外处理。
+
+        # 整除之后，尾部的部分cdim % group_size_m. 和 cdimy 再组成一个新的layout。
+
         
         
 
         # Deal with the tail part
         # 处理 M/N 维尾块，避免越界访问。
-        if cluster_id >= num_reg_cids:
+        if cluster_id >= num_reg_cids: # 
             tail_size_m = cdimx % group_size_m
             tail_layout = cute.make_layout(
                 (tail_size_m, cdimy), stride=(1, tail_size_m)
@@ -754,25 +759,32 @@ class HopperWgmmaGemmKernel:
             tail_cid_m, tail_cid_n = tail_layout.get_flat_coord(tail_cid)
             cid_m = cute.size(s_shape, mode=[0]) + tail_cid_m
             cid_n = tail_cid_n
+        # TODO: 需要确定swizzle真的改善了L2 cache hit
 
         # Get the pid from cluster id
         # 根据 cluster id 计算当前 CTA 对应的 tile id。
         bidx_in_cluster = cute.arch.block_in_cluster_idx()
-        pid_m = cid_m * self.cluster_shape_mn[0] + bidx_in_cluster[0]
+        pid_m = cid_m * self.cluster_shape_mn[0] + bidx_in_cluster[0] # block id . x/y
         pid_n = cid_n * self.cluster_shape_mn[1] + bidx_in_cluster[1]
 
         tile_coord_mnkl = (pid_m, pid_n, None, bidz)
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
+            cute.arch.block_idx_in_cluster() # 疑问，具体是？
         )
-        cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
+        """
+        注意， block_in_cluster_idx, 和 block_idx_in_cluster是两个完全不同的概念
+        block_in_cluster_idx:  多维坐标
+        block_idx_in_cluster:  cluster内的block的线性id: Returns the linearized identifier of the CTA within the cluster.
+        """
+        #  cluster_coord_mnk: cta_layout_mnk下这个block/cluster的多维坐标
+        cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster) # TODO: 是否是cluster 在cta layout中的坐标？ 还是在cluster内的坐标？
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get mcast mask
         # 生成 TMA multicast mask，决定数据广播给 cluster 内哪些 CTA。
         # ///////////////////////////////////////////////////////////////////////////////
-        a_mcast_mask = cute.make_layout_image_mask(
-            cta_layout_mnk, cluster_coord_mnk, mode=1
+        a_mcast_mask = cute.make_layout_image_mask( # TODO: 为什么是image mask？
+            cta_layout_mnk, cluster_coord_mnk, mode=1 # 当前的cta的坐标（cluster_coord_mnk），在给定cta_layout_mnk的layout下，会广播给哪些cta，
         )
         b_mcast_mask = cute.make_layout_image_mask(
             cta_layout_mnk, cluster_coord_mnk, mode=0
@@ -790,8 +802,8 @@ class HopperWgmmaGemmKernel:
         #  Alloc and init AB full/empty + ACC full mbar (pipeline)
         #  分配并初始化 A/B full/empty barrier，以及 accumulator/epilogue 相关 barrier。
         # /////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(self.shared_storage)
+        smem = cutlass.utils.SmemAllocator() # A helper class for managing shared memory allocation on GPU.
+        storage = smem.allocate(self.shared_storage) # 需要提前先算好需要多少，不支持dynamic smem allocation
 
         # mbar arrays
         # mbar 数组保存各个 pipeline stage 的 barrier。
@@ -800,20 +812,36 @@ class HopperWgmmaGemmKernel:
         # Threads/warps participating in this pipeline
         # 定义参与该 pipeline 的线程数/warp 数。
         mainloop_pipeline_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread
+            pipeline.Agent.Thread # NOTE: producer_thread 只用一个线程就够了，因为 producer 只负责发起 TMA copy，TMA copy 本身是异步的
         )
-        # Each warp will constribute to the arrive count with the number of mcast size
+
+        # Each warp will contribute to the arrive count with the number of mcast size
         # 每个 warp 对 arrive count 的贡献会乘上 multicast 的 CTA 数量。
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         num_warps = self.threads_per_cta // 32
-        consumer_arrive_cnt = mcast_size * num_warps
-        mainloop_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, consumer_arrive_cnt
-        )
+        """
+        为什么consumer_arrive_cnt(empty_barrier)的count需要是mcast_size * num_warps.
+            - num_mcast_ctas_a/b 都是指cluster对应有多少个cta，一旦有大于1个cta，就要有广播行为，广播到对应的warp也必须用完data，然后需要发arrive信号
+            - 为什么需要乘以warps： 这里的warps谁参与mma的warp数量
+            当有multicast发生时，需要保证自己用cluster内其他cta/其他cta在cluster内用本cta 的smem的行为结束。标志结束的方式就是
+            跨cta去改smem的mbarrier
 
-        cta_layout_vmnk = cute.make_layout((1, *cta_layout_mnk.shape))
+        """
+        consumer_arrive_cnt = mcast_size * num_warps # NOTE：理解这里的arrive_cnt, 看起来是每一个warp都会参与到multicast? 疑问： 为什么？
+        mainloop_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, consumer_arrive_cnt # 疑问：这里的cooperative group对应到cuda里的cooperative group，是一个东西吗？ 具体怎么使用的？ 
+            # 这里我理解是需要相当一部分的线程用来确定tma + multicast完成了
+        ) # TODO: 检查其他cta怎么改本cta的smem的，mbarrier
+
+        cta_layout_vmnk = cute.make_layout((1, *cta_layout_mnk.shape)) # NOTE: 用来把扩展shape的方法 cute make layout
         # 创建 mainloop 的 TMA async pipeline，用 full/empty barrier 管理多 stage A/B shared-memory buffer。
-        mainloop_pipeline = pipeline.PipelineTmaAsync.create(
+        mainloop_pipeline = pipeline.PipelineTmaAsync.create( # 对于一个sm90的pipeline来说，需要
+        # 做的事情包括： 
+        # barrier的数量，barrier的ptr，每次需要搬运的data量， 搬运的layout， 
+        # 有多少个stage
+
+        # TODO: 对于一个异步系统来说，如何能做到高效的overlap。并且各个阶段是如何做到barrier的？
+        # TODO: 疑问： empty/full barrier的state切换是怎么实现的，在内置func里？
             barrier_storage=mainloop_pipeline_array_ptr,
             num_stages=self.ab_stage,
             producer_group=mainloop_pipeline_producer_group,
@@ -826,6 +854,7 @@ class HopperWgmmaGemmKernel:
         #  Cluster arrive after barrier init
         #  barrier 初始化后，cluster 内 CTA 做一次 arrive 同步。
         # cluster 内 CTA 到达 pipeline 初始化同步点，确保 barrier 初始化过程可见。
+        # TODO： 尝试理解为什么要init cluster?
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -838,6 +867,7 @@ class HopperWgmmaGemmKernel:
         sB = storage.sB.get_tensor(
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
+        # NOTE: 复用了ptr，注意需要判断。是不是size越界会报错
         sC_ptr = cute.recast_ptr(
             sA.iterator, epi_smem_layout_staged.inner, dtype=self.c_dtype
         )
@@ -849,9 +879,10 @@ class HopperWgmmaGemmKernel:
         # ///////////////////////////////////////////////////////////////////////////////
         # (bM, bK, RestK)
         # 从全局 tensor 中切出当前 tile/所有 tile 的局部视图，避免手写 M/N/K/L 索引计算。
+        # 拿到的是一个global tensor里A/B的切片
         gA_mkl = cute.local_tile(
-            mA_mkl, self.tile_shape_mnk, tile_coord_mnkl, proj=(1, None, 1)
-        )
+            mA_mkl, self.tile_shape_mnk, tile_coord_mnkl, proj=(1, None, 1)#TODO: 这里是否一定是三维度
+        ) # return的是一个cute dsl tensor
         # (bN, bK, RestK)
         # 从全局 tensor 中切出当前 tile/所有 tile 的局部视图，避免手写 M/N/K/L 索引计算。
         gB_nkl = cute.local_tile(
@@ -859,6 +890,7 @@ class HopperWgmmaGemmKernel:
         )
         # (bM, bN)
         # 从全局 tensor 中切出当前 tile/所有 tile 的局部视图，避免手写 M/N/K/L 索引计算。
+        # TODO: 疑问： 为什么 AB有 rest k， 但是c没有
         gC_mnl = cute.local_tile(
             mC_mnl, self.tile_shape_mnk, tile_coord_mnkl, proj=(1, 1, None)
         )
@@ -869,12 +901,12 @@ class HopperWgmmaGemmKernel:
         # //////////////////////////////////////////////////////////////////////////////
         warp_group_idx = cute.arch.make_warp_uniform(
             tidx // self.num_threads_per_warp_group
-        )
+        ) # TODO： 疑问： 为什么就不能直接用tidx // self.num_threads_per_warp_group
         warp_group_thread_layout = cute.make_layout(
             self.mma_warp_groups, stride=self.num_threads_per_warp_group
-        )
-        thr_mma = tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx))
-
+        ) # 参与wgmma的warp group的数量， 步长是num_threads_per_warp_group
+        thr_mma = tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx)) # 参与当前tma的thread的
+        # TODO: 这个thr_mma一般要怎么用, 这里的tCgC一般是什么意思
         tCgC = thr_mma.partition_C(gC_mnl)
 
         # //////////////////////////////////////////////////////////////////////////////
@@ -884,7 +916,7 @@ class HopperWgmmaGemmKernel:
         #  TMA load A partition_S/D
         #  为 A 的 TMA load 创建源端 S 和目的端 D 分区。
         a_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (0, None, 0)).shape)
-        a_cta_crd = cluster_coord_mnk[1]
+        a_cta_crd = cluster_coord_mnk[1] # TODO： 这个是什么意思
         sA_for_tma_partition = cute.group_modes(sA, 0, 2)
         gA_for_tma_partition = cute.group_modes(gA_mkl, 0, 2)
         # 把 global/shared tensor 按 TMA atom 和 CTA/cluster 坐标分区，得到 copy 指令需要的源和目的视图。
@@ -915,28 +947,31 @@ class HopperWgmmaGemmKernel:
         #  Make fragments
         #  创建寄存器 fragment，包括 accumulator 和临时寄存器视图。
         # //////////////////////////////////////////////////////////////////////////////
-        tCsA = thr_mma.partition_A(sA)
+        tCsA = thr_mma.partition_A(sA) # TODO: 疑问。 thr_mma 和 tiled_mma的区别和联系是？
         tCsB = thr_mma.partition_B(sB)
-        tCrA = tiled_mma.make_fragment_A(tCsA)
+        tCrA = tiled_mma.make_fragment_A(tCsA)# TODO： 这里的txry一般指的是什么。
+        # TODO" tiled_mma究竟有什么作用
         tCrB = tiled_mma.make_fragment_B(tCsB)
-
+        # TODO:理清，txry 返回的结果有什么不太一样的？
         acc_shape = tCgC.shape
         # 创建寄存器 tensor，通常用于 accumulator、临时 accumulator 或 epilogue 类型转换缓冲。
         accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
 
         # ///////////////////////////////////////////////////////////////////////////////
-        #  Cluster wait
+        #  Cluster wait TODO: 这里特别发现，cluster引入之后 相关的同步都需要考虑
+        # 比如前面的 pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
         #  等待 cluster 级同步完成。
         # ///////////////////////////////////////////////////////////////////////////////
         # cluster wait for barrier init
         # 等待 barrier 初始化在 cluster 内可见。
         # 等待 pipeline 初始化完成，避免在 barrier 未准备好时开始 producer/consumer 操作。
+        # TODO: 疑问" 为什么前面是init_arrive,这里是init_wait?
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
         # /////////////////////////////////////////////////////////////////////////////
         #  Prefetch
         #  mainloop 前的预取阶段。
         # /////////////////////////////////////////////////////////////////////////////
-        k_tile_cnt = cute.size(gA_mkl, mode=[2])
+        k_tile_cnt = cute.size(gA_mkl, mode=[2]) # TODO" 为什么是mode2? k不是在1吗？
         prefetch_k_tile_cnt = cutlass.max(cutlass.min(self.ab_stage, k_tile_cnt), 0)
 
         mainloop_producer_state = pipeline.make_pipeline_state(
@@ -948,7 +983,7 @@ class HopperWgmmaGemmKernel:
             # Prefetch TMA load
             # 预取首批 TMA load。
             # /////////////////////////////////////////////////////////////////////////////
-            for prefetch_idx in cutlass.range(prefetch_k_tile_cnt, unroll=1):
+            for prefetch_idx in cutlass.range(prefetch_k_tile_cnt, unroll=1): # TODO: 为什么unroll只有1
                 # /////////////////////////////////////////////////////////////////////////////
                 #  Wait for A/B buffers to be empty before loading into them
                 #  写入 A/B buffer 前，先等待对应 pipeline stage 为空。
@@ -962,7 +997,7 @@ class HopperWgmmaGemmKernel:
                 #  切出当前 k_tile 对应的 global/shared memref。
                 # /////////////////////////////////////////////////////////////////////////////
                 tAgA_k = tAgA_mkl[(None, mainloop_producer_state.count)]
-                tAsA_pipe = tAsA[(None, mainloop_producer_state.index)]
+                tAsA_pipe = tAsA[(None, mainloop_producer_state.index)] # TODO" 这个state的count和index的关系是？
 
                 tBgB_k = tBgB_nkl[(None, mainloop_producer_state.count)]
                 tBsB_pipe = tBsB[(None, mainloop_producer_state.index)]
@@ -994,32 +1029,40 @@ class HopperWgmmaGemmKernel:
                 # Mainloop pipeline's producer commit is a NOP
                 # mainloop pipeline 的 producer commit 在这里是空操作，但保留统一的 pipeline 语义。
                 # producer 提交当前 pipeline stage；TMA async pipeline 中它主要推进状态语义。
-                mainloop_pipeline.producer_commit(mainloop_producer_state)
+                mainloop_pipeline.producer_commit(mainloop_producer_state) # TODO: 这里为什么是空操作？
                 mainloop_producer_state.advance()
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Prologue MMAs
         #  prologue 阶段先发起一批 MMA，填充 WGMMA pipeline。
+        #  TODO: 有必要一开始就做prologue的mma吗？
+        # TODO: 疑问， 负责prologue这部分的mma是哪些warp负责呢？
         # /////////////////////////////////////////////////////////////////////////////
-        k_pipe_mmas = 1
-
+        k_pipe_mmas = 1 # TODO" 发起多少mma比较合适？
+        # producer phase是1， comsumer phase是0
         mainloop_consumer_read_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.ab_stage
-        )
+        ) # TODO: 这个state主要是用来干嘛的？
         mainloop_consumer_release_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.ab_stage
-        )
+        )# TODO" 为什么需要两个的? 是因为cluster shape (2, 1, 1)吗？ 
+        # TODO: 这两个state是如何搭配的？
 
         peek_ab_full_status = cutlass.Boolean(1)
-        if mainloop_consumer_read_state.count < k_tile_cnt:
+        if mainloop_consumer_read_state.count < k_tile_cnt: # TODO: 读的数量（stage数量？）少于k_tile?
             peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
                 mainloop_consumer_read_state
-            )
+            ) # TODO: 经常会见到wait/ try_wait的场景，这样的场景是什么意思？
+            # 猜测：拿到一个可以实时监测consumer ready与否的bool变量
 
-        tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
-        num_k_blocks = cute.size(tCrA, mode=[2])
+        tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False) # TODO: 这句什么意思？ accumulate? 是否意味着结果是accumulator # NOTE: 重点！！
+        # 猜测。这哦这句话和njk里的对accumulator的属性设置类似，False代表计算的一开始需要对这个accumulator置零？
+
+        num_k_blocks = cute.size(tCrA, mode=[2]) # TODO： 为什么是从tCrA里读？
+        # 这里的num_k_blocks的不是k_tile,而是一个tile内有多少k cta？
+        # NOTE: num_k_blocks 一般是K / BK, 这里有吗？
         # 沿 K 维 tile 迭代 mainloop；每轮消费一个 K tile 的 A/B 数据并贡献一部分矩阵乘加。
-        for k_tile in cutlass.range_constexpr(k_pipe_mmas):
+        for k_tile in cutlass.range_constexpr(k_pipe_mmas): # 注意，常数下的range for loop, 可以用range_constexpr
             # Wait for A/B buffer to be ready
             # 等待 A/B buffer 中的数据准备好。
             # consumer 等待当前 pipeline stage 的 TMA load 完成，确保 WGMMA 读取有效的 shared-memory 数据。
@@ -1027,33 +1070,34 @@ class HopperWgmmaGemmKernel:
                 mainloop_consumer_read_state, peek_ab_full_status
             )
 
-            cute.nvgpu.warpgroup.fence()
+            cute.nvgpu.warpgroup.fence() # TODO: fence(), full barrier wait, 等等所有的fence类变量。什么时候该用？有哪些限制？各自什么作用？
             # 遍历当前 K tile 内的 WGMMA K-block；每个 block 发起一次 CuTe GEMM/WGMMA。
             for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
                 k_block_coord = (
                     None,
                     None,
                     k_block_idx,
-                    mainloop_consumer_read_state.index,
+                    mainloop_consumer_read_state.index, # 猜测这里的index指的是stage的index
                 )
                 tCrA_1phase = tCrA[k_block_coord]
                 tCrB_1phase = tCrB[k_block_coord]
 
                 # 发起一次 CuTe GEMM/WGMMA，把当前 A/B fragment 累加到 accumulator。
-                cute.gemm(
+                cute.gemm( # TODO" 查看需要tiled_mma里的哪些变量？
                     tiled_mma,
                     accumulators,
                     tCrA_1phase,
                     tCrB_1phase,
                     accumulators,
                 )
-                tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+                tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True) 
+                # TODO: 是否每次gemm后都需要设置一次这个, 还是只有第一次需要？
 
             # 提交当前 WGMMA group，让异步矩阵乘加进入执行队列。
             cute.nvgpu.warpgroup.commit_group()
             mainloop_consumer_read_state.advance()
             peek_ab_full_status = cutlass.Boolean(1)
-            if mainloop_consumer_read_state.count < k_tile_cnt:
+            if mainloop_consumer_read_state.count < k_tile_cnt: # 
                 peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
                     mainloop_consumer_read_state
                 )
@@ -1070,7 +1114,8 @@ class HopperWgmmaGemmKernel:
             # /////////////////////////////////////////////////////////////////////////////
             # consumer 等待当前 pipeline stage 的 TMA load 完成，确保 WGMMA 读取有效的 shared-memory 数据。
             mainloop_pipeline.consumer_wait(
-                mainloop_consumer_read_state, peek_ab_full_status
+                mainloop_consumer_read_state, peek_ab_full_status # TODO: ab_full_status满了
+                # try_wait_token就是1，此时需要等待？
             )
             # /////////////////////////////////////////////////////////////////////////////
             #  WGMMA
@@ -1078,6 +1123,7 @@ class HopperWgmmaGemmKernel:
             # /////////////////////////////////////////////////////////////////////////////
             cute.nvgpu.warpgroup.fence()
             # 遍历当前 K tile 内的 WGMMA K-block；每个 block 发起一次 CuTe GEMM/WGMMA。
+            # 一个tile内的所有blocks全部进去
             for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
                 k_block_coord = (
                     None,
@@ -1102,25 +1148,29 @@ class HopperWgmmaGemmKernel:
             # Wait on the wgmma barrier for previous k_pipe_mmas wgmmas to complete
             # 等待前面提交的一批 WGMMA 完成。
             # 等待 WGMMA group 完成；在读取 accumulator 或释放 buffer 前必须保证写入结束。
-            cute.nvgpu.warpgroup.wait_group(k_pipe_mmas)
+            cute.nvgpu.warpgroup.wait_group(k_pipe_mmas) # TODO： 怎么判断等待的是前面的那一批，而不是后面新加上来的那一批； 换句话，假设k_pipe_mmas不是1，这样写还对吗
 
             # consumer 释放已经用完的 pipeline stage，让 producer 后续可以复用该 shared-memory buffer。
             mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
 
-            mainloop_consumer_read_state.advance()
+            mainloop_consumer_read_state.advance() # 
             # consumer 释放已经用完的 pipeline stage，让 producer 后续可以复用该 shared-memory buffer。
-            mainloop_consumer_release_state.advance()
+            mainloop_consumer_release_state.advance() # read_state会比release_state快一步
 
             peek_ab_full_status = cutlass.Boolean(1)
             if mainloop_consumer_read_state.count < k_tile_cnt:
                 peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
                     mainloop_consumer_read_state
-                )
+                ) # TODO" 这步wait究竟什么意思，为什么main loop里也有
             # /////////////////////////////////////////////////////////////////////////////
             #  TMA load
             # /////////////////////////////////////////////////////////////////////////////
-            # 按 warp 编号分配轻量控制工作，例如预取 TMA descriptor、发起 TMA copy 或执行 epilogue store。
+            # 按 warp 编号分配轻量控制工作，例如预取 TMA descriptor、发起 TMA copy 或执行 epilogue store。 
             if warp_idx == 0 and mainloop_producer_state.count < k_tile_cnt:
+                # NOTE" mainloop_producer_state.count < k_tile_cnt：总的加载count小于最终需要的加载
+                # 数量时，就可以一直用tma加载； 同时因为tma需要的warp_idx不用很多，这里只让一个warp去
+                # 操作即可
+                # TODO" 这里是否已经做了producer warp和consumer warp的关键区分？ 
                 # /////////////////////////////////////////////////////////////////////////////
                 #  Wait for A/B buffers to be empty before loading into them
                 #  写入 A/B buffer 前，先等待对应 pipeline stage 为空。
@@ -1173,6 +1223,8 @@ class HopperWgmmaGemmKernel:
         # /////////////////////////////////////////////////////////////////////////////
         #  EPILOG
         #  epilogue 写回阶段
+        # TODO: 问题， 为什么epilogue 不直接做对global mem写入，还要重新写一遍smem?？
+        # 解答： 因为想用TMA做直接写入，TMA只能操作smem<->gmem
         # /////////////////////////////////////////////////////////////////////////////
         # 等待 WGMMA group 完成；在读取 accumulator 或释放 buffer 前必须保证写入结束。
         cute.nvgpu.warpgroup.wait_group(0)
@@ -1190,6 +1242,7 @@ class HopperWgmmaGemmKernel:
             # the mainloop is reused in the epilogue.
             # 上一行说明的是 mainloop SMEM 与 epilogue SMEM 的复用关系。
             cute.arch.sync_threads()
+        # TODO: epilogue 是否有机会和下一阶段的也overlap起来？
 
         copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
             self.c_layout,
@@ -1197,24 +1250,25 @@ class HopperWgmmaGemmKernel:
             elem_ty_acc=self.acc_dtype,
         )
 
-        copy_atom_C = cute.make_copy_atom(
-            cute.nvgpu.warp.StMatrix8x8x16bOp(
-                self.c_layout.is_m_major_c(),
+        copy_atom_C = cute.make_copy_atom( # 看起来某些atom op是可以自己选的
+            cute.nvgpu.warp.StMatrix8x8x16bOp( # TODO: 为什么选这个size ?
+                self.c_layout.is_m_major_c() ,
                 4,
             ),
             self.c_dtype,
         )
-
+        # 给定mma的setting，给定copy的原子类型，似乎就可以tiled op
         tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
 
         tiled_copy_r2s = cute.make_tiled_copy_S(
             copy_atom_r2s,
             tiled_copy_C_Atom,
+            # TODO: tiled copy不同的类型代表什么意思？
         )
 
         # (R2S, R2S_M, R2S_N, PIPE_D)
-        thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
-        tRS_sD = thr_copy_r2s.partition_D(sC)
+        thr_copy_r2s = tiled_copy_r2s.get_slice(tidx) # TODO: 给定对应的thread id, 求一些smem的
+        tRS_sD = thr_copy_r2s.partition_D(sC) # 目标的线程
         # (R2S, R2S_M, R2S_N)
         tRS_rAcc = tiled_copy_r2s.retile(accumulators)
 
@@ -1223,6 +1277,7 @@ class HopperWgmmaGemmKernel:
         rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
         tRS_rD_layout = cute.make_layout(rD_shape[:3])
         # 创建寄存器 tensor，通常用于 accumulator、临时 accumulator 或 epilogue 类型转换缓冲。
+        # NOTE: 创建临时寄存器的func
         tRS_rD = cute.make_rmem_tensor_like(tRS_rD_layout, self.acc_dtype)
         size_tRS_rD = cute.size(tRS_rD)
 
@@ -1268,7 +1323,7 @@ class HopperWgmmaGemmKernel:
             # 创建寄存器 tensor，通常用于 accumulator、临时 accumulator 或 epilogue 类型转换缓冲。
             tRS_rD_out = cute.make_rmem_tensor_like(tRS_rD_layout, self.c_dtype)
             acc_vec = tRS_rD.load()
-            tRS_rD_out.store(acc_vec.to(self.c_dtype))
+            tRS_rD_out.store(acc_vec.to(self.c_dtype))# 类型转换 TODO: 为什么只是换一个类型，就需要两个寄存器？还是因为原本寄存器layout不符合？
 
             # Copy from D registers to shared memory
             # 将 D 寄存器中的结果写入 shared memory。
@@ -1276,7 +1331,7 @@ class HopperWgmmaGemmKernel:
             # 执行 CuTe copy；根据上下文可能是 TMA load、TMA store 或寄存器到 shared memory 的 copy。
             cute.copy(
                 tiled_copy_r2s, tRS_rD_out, tRS_sD[(None, None, None, epi_buffer)]
-            )
+            ) # 寄存器到smem
 
             # 下面是一个多行函数调用；用一段注释解释整个调用，参数行保持干净以便对照源码。
             cute.arch.fence_proxy(
